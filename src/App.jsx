@@ -28,7 +28,7 @@ const EMAIL_TEMPLATES = {
   expose_anfrage: (obj) => [
     `Betreff: Anfrage – ${obj.titel || obj.adresse || "Ihre Immobilie"}`,
     ``,
-    `Guten Tag Frau/Herr [NAME],`,
+    `Guten Tag${obj.anbieter ? ` ${obj.anbieter}` : " Frau/Herr [NAME]"},`,
     ``,
     `ich bin auf Ihr Inserat aufmerksam geworden und habe großes Interesse an der angebotenen Immobilie – ${obj.titel || "[Objektbezeichnung]"}${obj.adresse ? ` mit der Adresse ${obj.adresse}` : ""}.`,
     ``,
@@ -46,7 +46,7 @@ const EMAIL_TEMPLATES = {
   termin_anfrage: (obj) => [
     `Betreff: Terminanfrage Besichtigung – ${obj.titel || obj.adresse || "Ihre Immobilie"}`,
     ``,
-    `Guten Tag Frau/Herr [NAME],`,
+    `Guten Tag${obj.anbieter ? ` ${obj.anbieter}` : " Frau/Herr [NAME]"},`,
     ``,
     `ich bin interessiert an der Immobilie – ${obj.titel || "[Objektbezeichnung]"}${obj.adresse ? ` (${obj.adresse})` : ""} – und würde diese gerne persönlich besichtigen.`,
     ``,
@@ -66,46 +66,110 @@ const STORAGE_KEY = "immo_crm_v1";
 function loadData() { try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : []; } catch { return []; } }
 function saveData(d) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch (e) { console.error(e); } }
 
-// ─── AI PDF Extraction ───────────────────────────────────────────────────────
-async function extractFromPDF(base64Data) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      messages: [{
-        role: "user",
-        content: [
-          {
-            type: "document",
-            source: { type: "base64", media_type: "application/pdf", data: base64Data }
-          },
-          {
-            type: "text",
-            text: `Lies dieses Immobilien-Exposé und extrahiere folgende Informationen. Antworte NUR mit einem JSON-Objekt, ohne Erklärungen, ohne Backticks:
-{
-  "strasse": "Straßenname mit Hausnummer",
-  "plz": "Postleitzahl",
-  "ort": "Stadtname",
-  "titel": "Exposé [Straße mit Hausnummer], [PLZ] [Ort]",
-  "preis": "Kaufpreis als Text z.B. 450.000 €",
-  "groesse": "Wohnfläche z.B. 85 m²",
-  "zimmer": "Anzahl Zimmer als Zahl z.B. 3",
-  "anbieter": "Name des Maklers oder Anbieters falls vorhanden"
-}
-Falls ein Wert nicht gefunden wird, setze null.`
-          }
-        ]
-      }]
-    })
+function fileToBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(",")[1]);
+    r.onerror = () => rej(new Error("Lesefehler"));
+    r.readAsDataURL(file);
   });
-  const data = await response.json();
-  const text = data.content?.map(i => i.text || "").join("") || "";
-  const clean = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
 }
-// ─────────────────────────────────────────────────────────────────────────────
+
+async function extractFromPDF(base64Data) {
+  const prompt = `Du bist ein Assistent der deutsche Immobilien-Exposés analysiert.
+Lies dieses PDF-Exposé sorgfältig durch – auch Fußzeilen, letzte Seite, Kontaktdaten.
+
+Extrahiere folgende Informationen und antworte AUSSCHLIESSLICH mit einem JSON-Objekt.
+Kein erklärender Text, keine Backticks, nur das JSON:
+
+{
+  "strasse": "Straßenname mit Hausnummer (nur Straße + Nr, ohne PLZ/Ort)",
+  "plz": "5-stellige Postleitzahl",
+  "ort": "Stadtname",
+  "titel": "Exposé [Straße Hausnr], [PLZ] [Ort]",
+  "preis": "Kaufpreis als Text mit € z.B. 349.000 €",
+  "groesse": "Wohnfläche mit m² z.B. 78 m²",
+  "zimmer": "Anzahl Zimmer als Zahl z.B. 3",
+  "anbieter": "Ansprechpartner-Name oder Makler-Name (suche in Fußzeile, Kontaktbereich, letzter Seite – NUR den Namen der Person, z.B. 'Herr Müller' oder 'Frau Schmidt', KEIN Firmenname)"
+}
+
+Wichtige Hinweise:
+- Suche den Anbieter-Namen besonders in der Fußzeile jeder Seite und auf der letzten Seite
+- Bei Kaufpreis: ignoriere Nebenkosten, nimm nur den eigentlichen Kaufpreis
+- Falls ein Wert wirklich nicht gefunden wird: setze null (nicht leer, nicht unbekannt)`;
+
+  // Try with document type first (best for PDFs)
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "base64", media_type: "application/pdf", data: base64Data }
+            },
+            { type: "text", text: prompt }
+          ]
+        }]
+      })
+    });
+
+    if (!response.ok) throw new Error(`API ${response.status}`);
+    const data = await response.json();
+
+    if (data.error) throw new Error(data.error.message);
+
+    const text = (data.content || []).map(i => i.text || "").join("").trim();
+    // Strip any accidental markdown
+    const clean = text.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+    const parsed = JSON.parse(clean);
+    return parsed;
+
+  } catch (err) {
+    console.error("Erste Methode fehlgeschlagen:", err);
+
+    // Fallback: try as image (convert first page)
+    // Actually just retry with slightly different prompt as plain text request
+    const response2 = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "base64", media_type: "application/pdf", data: base64Data },
+              cache_control: { type: "ephemeral" }
+            },
+            {
+              type: "text",
+              text: `Analysiere dieses Immobilien-Exposé. Antworte nur mit JSON (keine Backticks):
+{"strasse":null,"plz":null,"ort":null,"titel":null,"preis":null,"groesse":null,"zimmer":null,"anbieter":null}
+Fülle alle Felder aus die du findest. titel = "Exposé [Straße], [PLZ] [Ort]". anbieter = Name des Ansprechpartners aus Fußzeile/letzter Seite.`
+            }
+          ]
+        }]
+      })
+    });
+
+    if (!response2.ok) throw new Error(`API Fallback ${response2.status}`);
+    const data2 = await response2.json();
+    if (data2.error) throw new Error(data2.error.message);
+
+    const text2 = (data2.content || []).map(i => i.text || "").join("").trim();
+    const jsonMatch = text2.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error("Kein JSON in Antwort");
+    return JSON.parse(jsonMatch[0]);
+  }
+}
 
 export default function ImmoCRM() {
   const [objekte, setObjekte] = useState(() => loadData());
@@ -117,7 +181,8 @@ export default function ImmoCRM() {
   const [filterStatus, setFilterStatus] = useState("alle");
   const [toast, setToast] = useState(null);
   const [pdfAnalyzing, setPdfAnalyzing] = useState(false);
-  const [extractedForm, setExtractedForm] = useState(null); // preview before saving
+  const [extractedForm, setExtractedForm] = useState(null);
+  const [extractError, setExtractError] = useState(null);
   const fileRef = useRef();
   const newPdfRef = useRef();
   const screenshotRef = useRef();
@@ -126,39 +191,50 @@ export default function ImmoCRM() {
 
   useEffect(() => { saveData(objekte); }, [objekte]);
 
-  const showToast = (msg, type = "ok") => { setToast({ msg, type }); setTimeout(() => setToast(null), 3500); };
+  const showToast = (msg, type = "ok") => { setToast({ msg, type }); setTimeout(() => setToast(null), 4000); };
 
-  // ── Handle new PDF upload on "Neu" form ──────────────────────────────────
   const handleNewPDF = async (file) => {
+    // Validate file
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      showToast("Bitte eine PDF-Datei hochladen", "err"); return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      showToast("PDF zu groß (max. 20 MB)", "err"); return;
+    }
+
     setPdfAnalyzing(true);
-    showToast("🤖 KI liest das Exposé...", "ok");
+    setExtractError(null);
+    showToast("🤖 KI liest das Exposé...");
+
     try {
       const base64 = await fileToBase64(file);
       const extracted = await extractFromPDF(base64);
+
+      const adresse = [extracted.strasse, extracted.plz && extracted.ort ? `${extracted.plz} ${extracted.ort}` : extracted.ort].filter(Boolean).join(", ");
+
       setForm(prev => ({
         ...prev,
-        adresse: [extracted.strasse, extracted.plz, extracted.ort].filter(Boolean).join(", ") || prev.adresse,
+        adresse: adresse || prev.adresse,
         titel: extracted.titel || prev.titel,
         preis: extracted.preis || prev.preis,
         groesse: extracted.groesse || prev.groesse,
-        zimmer: extracted.zimmer || prev.zimmer,
+        zimmer: extracted.zimmer ? String(extracted.zimmer) : prev.zimmer,
         anbieter: extracted.anbieter || prev.anbieter,
       }));
       setExtractedForm({ base64: `data:application/pdf;base64,${base64}`, name: file.name });
       showToast("✓ Felder automatisch ausgefüllt – bitte prüfen!");
     } catch (e) {
-      console.error(e);
+      console.error("PDF Extraktion fehlgeschlagen:", e);
+      setExtractError("KI konnte das PDF nicht lesen. Bitte Felder manuell ausfüllen.");
       showToast("KI-Analyse fehlgeschlagen – bitte manuell ausfüllen", "err");
+      // Still store the PDF so it's not lost
+      try {
+        const base64 = await fileToBase64(file);
+        setExtractedForm({ base64: `data:application/pdf;base64,${base64}`, name: file.name });
+      } catch {}
     }
     setPdfAnalyzing(false);
   };
-
-  const fileToBase64 = (file) => new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(r.result.split(",")[1]);
-    r.onerror = () => rej(new Error("Lesefehler"));
-    r.readAsDataURL(file);
-  });
 
   const addObjekt = () => {
     if (!form.adresse.trim()) { showToast("Bitte Adresse eingeben", "err"); return; }
@@ -168,11 +244,12 @@ export default function ImmoCRM() {
       pdf: extractedForm?.base64 || null,
       pdfName: extractedForm?.name || null,
       terminScreenshots: [], emmanuelKommentar: "",
-      log: [{ ts: new Date().toISOString(), text: "Objekt angelegt" + (extractedForm ? " (PDF automatisch erkannt)" : "") }],
+      log: [{ ts: new Date().toISOString(), text: "Objekt angelegt" + (extractedForm ? " (PDF hochgeladen)" : "") }],
     };
     setObjekte(prev => [neu, ...prev]);
     setForm({ adresse: "", titel: "", preis: "", groesse: "", zimmer: "", anbieter: "", notizen: "" });
     setExtractedForm(null);
+    setExtractError(null);
     setView("liste");
     showToast("Objekt angelegt ✓");
   };
@@ -187,7 +264,7 @@ export default function ImmoCRM() {
   const handlePDF = (id, file) => {
     const reader = new FileReader();
     reader.onload = (e) => {
-      setObjekte(prev => prev.map(o => o.id === id ? { ...o, pdf: e.target.result, pdfName: file.name, log: [...o.log, { ts: new Date().toISOString(), text: `Exposé hochgeladen: ${file.name}` }] } : o));
+      setObjekte(prev => prev.map(o => o.id === id ? { ...o, pdf: e.target.result, pdfName: file.name, log: [...o.log, { ts: new Date().toISOString(), text: `PDF hochgeladen: ${file.name}` }] } : o));
       showToast("PDF gespeichert ✓");
     };
     reader.readAsDataURL(file);
@@ -245,7 +322,7 @@ export default function ImmoCRM() {
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          {view !== "liste" && <button onClick={() => { setView("liste"); setExtractedForm(null); }} style={{ background: "transparent", border: "1px solid #334155", color: "#94a3b8", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: 13 }}>← Zurück</button>}
+          {view !== "liste" && <button onClick={() => { setView("liste"); setExtractedForm(null); setExtractError(null); }} style={{ background: "transparent", border: "1px solid #334155", color: "#94a3b8", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: 13 }}>← Zurück</button>}
           {view === "liste" && <button onClick={() => setView("neu")} style={{ background: "linear-gradient(135deg, #3b82f6, #1d4ed8)", border: "none", color: "#fff", padding: "8px 16px", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 500 }}>+ Objekt</button>}
         </div>
       </div>
@@ -304,49 +381,57 @@ export default function ImmoCRM() {
         {/* NEU */}
         {view === "neu" && (
           <div>
-            <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 6, color: "#e2e8f0" }}>Neues Objekt anlegen</div>
-            <div style={{ fontSize: 13, color: "#64748b", marginBottom: 20 }}>Lade zuerst das PDF hoch – die KI füllt die Felder automatisch aus</div>
+            <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 4, color: "#e2e8f0" }}>Neues Objekt anlegen</div>
+            <div style={{ fontSize: 13, color: "#64748b", marginBottom: 20 }}>Lade zuerst das PDF hoch – KI füllt die Felder automatisch aus</div>
 
-            {/* PDF Upload – prominent at top */}
-            <div style={{ background: pdfAnalyzing ? "#0d2240" : extractedForm ? "#052e16" : "#0d1526", border: `2px dashed ${pdfAnalyzing ? "#3b82f6" : extractedForm ? "#4ade80" : "#334155"}`, borderRadius: 12, padding: 20, marginBottom: 20, textAlign: "center", transition: "all 0.3s" }}>
+            {/* PDF Upload Box */}
+            <div style={{ background: pdfAnalyzing ? "#0d2240" : extractedForm && !extractError ? "#052e16" : extractError ? "#2d0a0a" : "#0d1526", border: `2px dashed ${pdfAnalyzing ? "#3b82f6" : extractedForm && !extractError ? "#4ade80" : extractError ? "#ef4444" : "#334155"}`, borderRadius: 12, padding: 24, marginBottom: 20, textAlign: "center", transition: "all 0.3s" }}>
               {pdfAnalyzing ? (
                 <div>
-                  <div style={{ fontSize: 32, marginBottom: 8 }}>🤖</div>
-                  <div style={{ color: "#60a5fa", fontWeight: 600, marginBottom: 4 }}>KI analysiert das Exposé...</div>
-                  <div style={{ color: "#475569", fontSize: 12 }}>Einen Moment bitte</div>
+                  <div style={{ fontSize: 36, marginBottom: 10 }}>🤖</div>
+                  <div style={{ color: "#60a5fa", fontWeight: 600, fontSize: 15, marginBottom: 4 }}>KI analysiert das Exposé...</div>
+                  <div style={{ color: "#475569", fontSize: 12 }}>Liest Adresse, Preis, Zimmer und Makler-Name</div>
                 </div>
-              ) : extractedForm ? (
+              ) : extractedForm && !extractError ? (
                 <div>
-                  <div style={{ fontSize: 28, marginBottom: 6 }}>✅</div>
+                  <div style={{ fontSize: 32, marginBottom: 6 }}>✅</div>
                   <div style={{ color: "#4ade80", fontWeight: 600, marginBottom: 2 }}>{extractedForm.name}</div>
-                  <div style={{ color: "#64748b", fontSize: 12 }}>Felder wurden automatisch ausgefüllt</div>
-                  <input type="file" accept=".pdf" ref={newPdfRef} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleNewPDF(e.target.files[0]); }} />
-                  <button onClick={() => newPdfRef.current.click()} style={{ marginTop: 10, background: "transparent", border: "1px solid #334155", color: "#64748b", padding: "5px 12px", borderRadius: 6, cursor: "pointer", fontSize: 12 }}>Anderes PDF wählen</button>
+                  <div style={{ color: "#64748b", fontSize: 12, marginBottom: 10 }}>Felder wurden automatisch ausgefüllt – bitte prüfen</div>
+                  <input type="file" accept=".pdf" ref={newPdfRef} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleNewPDF(e.target.files[0]); newPdfRef.current.value = ""; }} />
+                  <button onClick={() => newPdfRef.current.click()} style={{ background: "transparent", border: "1px solid #334155", color: "#64748b", padding: "5px 14px", borderRadius: 6, cursor: "pointer", fontSize: 12 }}>Anderes PDF wählen</button>
+                </div>
+              ) : extractError ? (
+                <div>
+                  <div style={{ fontSize: 32, marginBottom: 8 }}>⚠️</div>
+                  <div style={{ color: "#f87171", fontWeight: 600, marginBottom: 4 }}>KI-Analyse fehlgeschlagen</div>
+                  <div style={{ color: "#94a3b8", fontSize: 12, marginBottom: 12 }}>Das PDF wurde trotzdem gespeichert. Bitte Felder manuell ausfüllen.</div>
+                  <input type="file" accept=".pdf" ref={newPdfRef} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleNewPDF(e.target.files[0]); newPdfRef.current.value = ""; }} />
+                  <button onClick={() => newPdfRef.current.click()} style={{ background: "#7f1d1d", border: "none", color: "#fca5a5", padding: "8px 16px", borderRadius: 7, cursor: "pointer", fontSize: 13 }}>Anderes PDF versuchen</button>
                 </div>
               ) : (
                 <div>
-                  <div style={{ fontSize: 36, marginBottom: 8 }}>📄</div>
-                  <div style={{ color: "#e2e8f0", fontWeight: 600, marginBottom: 4 }}>Exposé PDF hochladen</div>
-                  <div style={{ color: "#475569", fontSize: 12, marginBottom: 14 }}>KI erkennt Adresse, Preis, Größe und Zimmer automatisch</div>
-                  <input type="file" accept=".pdf" ref={newPdfRef} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleNewPDF(e.target.files[0]); }} />
-                  <button onClick={() => newPdfRef.current.click()} style={{ background: "linear-gradient(135deg, #3b82f6, #1d4ed8)", border: "none", color: "#fff", padding: "10px 24px", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600 }}>PDF auswählen</button>
-                  <div style={{ color: "#334155", fontSize: 11, marginTop: 10 }}>Oder manuell ausfüllen ↓</div>
+                  <div style={{ fontSize: 40, marginBottom: 10 }}>📄</div>
+                  <div style={{ color: "#e2e8f0", fontWeight: 600, fontSize: 15, marginBottom: 4 }}>Exposé PDF hochladen</div>
+                  <div style={{ color: "#475569", fontSize: 12, marginBottom: 16 }}>KI erkennt automatisch: Adresse · Preis · Größe · Zimmer · Makler</div>
+                  <input type="file" accept=".pdf" ref={newPdfRef} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleNewPDF(e.target.files[0]); newPdfRef.current.value = ""; }} />
+                  <button onClick={() => newPdfRef.current.click()} style={{ background: "linear-gradient(135deg, #3b82f6, #1d4ed8)", border: "none", color: "#fff", padding: "11px 28px", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600 }}>PDF auswählen</button>
+                  <div style={{ color: "#334155", fontSize: 11, marginTop: 12 }}>Oder Felder unten manuell ausfüllen ↓</div>
                 </div>
               )}
             </div>
 
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <Field label="Objektbezeichnung / Titel" value={form.titel} onChange={v => setForm({ ...form, titel: v })} placeholder='wird automatisch befüllt' />
-              <Field label="Adresse *" value={form.adresse} onChange={v => setForm({ ...form, adresse: v })} placeholder="Straße, PLZ Ort" />
+              <Field label="Objektbezeichnung / Titel" value={form.titel} onChange={v => setForm({ ...form, titel: v })} placeholder="wird automatisch befüllt" />
+              <Field label="Adresse *" value={form.adresse} onChange={v => setForm({ ...form, adresse: v })} placeholder="Straße Hausnr, PLZ Ort" />
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
                 <Field label="Preis" value={form.preis} onChange={v => setForm({ ...form, preis: v })} placeholder="450.000 €" />
                 <Field label="Größe" value={form.groesse} onChange={v => setForm({ ...form, groesse: v })} placeholder="85 m²" />
                 <Field label="Zimmer" value={form.zimmer} onChange={v => setForm({ ...form, zimmer: v })} placeholder="3" />
               </div>
-              <Field label="Anbieter / Makler" value={form.anbieter} onChange={v => setForm({ ...form, anbieter: v })} placeholder="Name oder E-Mail" />
+              <Field label="Anbieter / Makler (für E-Mail-Anrede)" value={form.anbieter} onChange={v => setForm({ ...form, anbieter: v })} placeholder="z.B. Herr Müller" />
               <Field label="Notizen" value={form.notizen} onChange={v => setForm({ ...form, notizen: v })} placeholder="Wichtige Infos..." multiline />
-              <button onClick={addObjekt} disabled={pdfAnalyzing} style={{ background: pdfAnalyzing ? "#1e293b" : "linear-gradient(135deg, #3b82f6, #1d4ed8)", border: "none", color: pdfAnalyzing ? "#475569" : "#fff", padding: "12px", borderRadius: 8, cursor: pdfAnalyzing ? "not-allowed" : "pointer", fontSize: 14, fontWeight: 600, marginTop: 8 }}>
-                {pdfAnalyzing ? "KI analysiert..." : "Objekt speichern"}
+              <button onClick={addObjekt} disabled={pdfAnalyzing} style={{ background: pdfAnalyzing ? "#1e293b" : "linear-gradient(135deg, #3b82f6, #1d4ed8)", border: "none", color: pdfAnalyzing ? "#475569" : "#fff", padding: "12px", borderRadius: 8, cursor: pdfAnalyzing ? "not-allowed" : "pointer", fontSize: 14, fontWeight: 600, marginTop: 4 }}>
+                {pdfAnalyzing ? "⏳ KI analysiert..." : "Objekt speichern"}
               </button>
             </div>
           </div>
@@ -359,12 +444,12 @@ export default function ImmoCRM() {
           return (
             <div>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 }}>
-                <div>
-                  <div style={{ fontSize: 20, fontWeight: 600, color: "#e2e8f0" }}>{obj.titel || obj.adresse}</div>
+                <div style={{ flex: 1, minWidth: 0, marginRight: 12 }}>
+                  <div style={{ fontSize: 18, fontWeight: 600, color: "#e2e8f0" }}>{obj.titel || obj.adresse}</div>
                   {obj.titel && <div style={{ fontSize: 13, color: "#64748b", marginTop: 2 }}>📍 {obj.adresse}</div>}
                   <div style={{ fontSize: 12, color: "#475569", marginTop: 4 }}>Angelegt am {fmt(obj.erstelltAm)}</div>
                 </div>
-                <div style={{ fontSize: 12, background: s.bg, color: s.color, padding: "5px 12px", borderRadius: 20, border: `1px solid ${s.color}44` }}>{s.icon} {s.label}</div>
+                <div style={{ fontSize: 11, background: s.bg, color: s.color, padding: "5px 12px", borderRadius: 20, border: `1px solid ${s.color}44`, whiteSpace: "nowrap", flexShrink: 0 }}>{s.icon} {s.label}</div>
               </div>
 
               <div style={{ background: "#0d1526", border: "1px solid #1e293b", borderRadius: 10, padding: 16, marginBottom: 16, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -387,8 +472,8 @@ export default function ImmoCRM() {
                 {obj.pdf ? (
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <span style={{ fontSize: 20 }}>📄</span>
-                    <span style={{ fontSize: 13, color: "#60a5fa" }}>{obj.pdfName}</span>
-                    <button onClick={() => { const a = document.createElement("a"); a.href = obj.pdf; a.download = obj.pdfName; a.click(); }} style={{ marginLeft: "auto", background: "#1e3a5f", border: "none", color: "#60a5fa", padding: "5px 12px", borderRadius: 6, cursor: "pointer", fontSize: 12 }}>Download</button>
+                    <span style={{ fontSize: 13, color: "#60a5fa", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{obj.pdfName}</span>
+                    <button onClick={() => { const a = document.createElement("a"); a.href = obj.pdf; a.download = obj.pdfName; a.click(); }} style={{ background: "#1e3a5f", border: "none", color: "#60a5fa", padding: "5px 12px", borderRadius: 6, cursor: "pointer", fontSize: 12, flexShrink: 0 }}>Download</button>
                   </div>
                 ) : (
                   <div>
@@ -413,6 +498,11 @@ export default function ImmoCRM() {
               {/* E-Mails */}
               <div style={{ background: "#0d1526", border: "1px solid #1e293b", borderRadius: 10, padding: 14, marginBottom: 16 }}>
                 <div style={{ fontSize: 11, color: "#475569", marginBottom: 10, textTransform: "uppercase", letterSpacing: 1 }}>E-Mails</div>
+                {obj.anbieter && (
+                  <div style={{ background: "#0a1628", border: "1px solid #1e3a5f", borderRadius: 7, padding: "8px 12px", marginBottom: 10, fontSize: 12, color: "#60a5fa" }}>
+                    👤 Anrede in E-Mails: <strong>Guten Tag {obj.anbieter}</strong>
+                  </div>
+                )}
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                   <EmailBtn label="📨 Exposé anfragen" onClick={() => openEmail(obj, "expose_anfrage")} color="#60a5fa" />
                   <EmailBtn label="📅 Termin anfragen" onClick={() => openEmail(obj, "termin_anfrage")} color="#fb923c" />
@@ -479,8 +569,13 @@ export default function ImmoCRM() {
         {view === "email" && (
           <div>
             <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 6, color: "#e2e8f0" }}>{emailMode === "expose_anfrage" ? "Exposé anfragen" : "Termin anfragen"}</div>
-            <div style={{ fontSize: 12, color: "#64748b", marginBottom: 16 }}>Ersetze <span style={{ color: "#fb923c", fontFamily: "monospace", background: "#431407", padding: "2px 6px", borderRadius: 4 }}>[NAME]</span> mit dem Namen des Anbieters, dann kopieren!</div>
-            <textarea value={emailText} onChange={e => setEmailText(e.target.value)} style={{ width: "100%", minHeight: 360, background: "#0d1526", border: "1px solid #1e293b", borderRadius: 10, padding: 16, color: "#cbd5e1", fontSize: 13, fontFamily: "'DM Mono', monospace", lineHeight: 1.7, resize: "vertical", boxSizing: "border-box", outline: "none" }} />
+            <div style={{ fontSize: 12, color: "#64748b", marginBottom: 16 }}>
+              {liveObj?.anbieter
+                ? <span style={{ color: "#4ade80" }}>✓ Anrede automatisch eingefügt: "Guten Tag {liveObj.anbieter}"</span>
+                : <span>Ersetze <span style={{ color: "#fb923c", fontFamily: "monospace", background: "#431407", padding: "2px 6px", borderRadius: 4 }}>[NAME]</span> mit dem Namen des Anbieters</span>
+              }
+            </div>
+            <textarea value={emailText} onChange={e => setEmailText(e.target.value)} style={{ width: "100%", minHeight: 380, background: "#0d1526", border: "1px solid #1e293b", borderRadius: 10, padding: 16, color: "#cbd5e1", fontSize: 13, fontFamily: "'DM Mono', monospace", lineHeight: 1.7, resize: "vertical", boxSizing: "border-box", outline: "none" }} />
             <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
               <button onClick={copyEmail} style={{ flex: 1, background: copied ? "#052e16" : "linear-gradient(135deg, #3b82f6, #1d4ed8)", border: copied ? "1px solid #4ade80" : "none", color: copied ? "#4ade80" : "#fff", padding: 12, borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600 }}>{copied ? "✓ Kopiert!" : "Kopieren"}</button>
               <button onClick={() => setView("detail")} style={{ background: "#1e293b", border: "none", color: "#94a3b8", padding: "12px 20px", borderRadius: 8, cursor: "pointer", fontSize: 14 }}>Zurück</button>
@@ -505,3 +600,4 @@ function InfoRow({ icon, label, value }) {
 function EmailBtn({ label, onClick, color }) {
   return <button onClick={onClick} style={{ background: "transparent", border: `1px solid ${color}44`, color, padding: "10px 14px", borderRadius: 8, cursor: "pointer", fontSize: 13, textAlign: "left" }} onMouseEnter={e => e.currentTarget.style.background = `${color}11`} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>{label}</button>;
 }
+
